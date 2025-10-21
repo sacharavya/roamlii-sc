@@ -1,0 +1,208 @@
+import ssl
+import json
+from celery import Celery
+from src.events.schemas import MainLinkSchema, EVENT_DETAILS_SCHEMA
+from src.bg_jobs.schema import WebhookConfig
+from src.firecrawl.core import firecrawl_api_key
+from src.database.core import redis_client
+from ..database.core import redis_url
+from ..firecrawl.core import firecrawl_app
+import requests
+from itertools import chain
+
+app = Celery('background_jobs', broker=redis_url, backend=redis_url)
+
+# Additional SSL configuration for broker and backend
+app.conf.broker_use_ssl = {
+    'ssl_cert_reqs': ssl.CERT_REQUIRED
+}
+app.conf.redis_backend_use_ssl = {
+    'ssl_cert_reqs': ssl.CERT_REQUIRED
+}
+
+
+@app.task(
+    name="event_main_links",
+    bind=True,
+    default_retry_delay=30 * 10,  # will retry after 5 minutes
+    retry_backoff=True,  # exponential backoff: 1s, 2s, 4s, 8s...
+    # retry_kwargs={"max_retries": 3},  # number of retries
+    max_retries=3,  # number of retries
+    retry_jitter=True  # add randomness to retry delay (avoid thundering herd)
+)
+# always return json
+def extract_events_list(self, url: str):
+    try:
+        result = firecrawl_app.scrape(
+            url=url,
+            actions=[
+                {
+                    "type": "scroll",
+                    "direction": "down"
+                }
+            ],
+            formats=[{
+                "type": "json",
+                "schema":  MainLinkSchema,
+                "prompt": """Extract ONLY the direct links to individual event pages or event popup/modal triggers.
+                            Include:
+                            - Links that lead to specific event details pages
+                            - Links that open event popups or modals with event details (these may have anchors like #calendar-xxx-event-xxx)
+                            - Links to event registration pages
+                            - Any clickable URLs that display information about a single, specific event
+
+                            Exclude:
+                            - Navigation links (menus, headers, footers)
+                            - Social media links
+                            - General category or filter pages
+                            - Login/signup links
+                            - Contact or about us pages
+                            - Any other non-event URLs
+
+                            Each link should point to or trigger the display of a single, specific event."""
+            }],
+            # webhook=WebhookConfig(
+            #     url="https://uncogently-unrivalrous-verlie.ngrok-free.dev/api/events/webhook/firecrawl",
+            #     events=["started", "page", "completed", "failed"],
+            # )
+
+        )
+
+        if result.metadata.status_code == 200:
+            events_links = result.json['event_links']
+            for link in events_links:
+                # TODO: save single link in event_links in redis
+                get_event_details.delay(link)
+
+        # print('/n')
+        # # print('result--------------------', result)
+        # print('result--------------------', result.json)
+        # print('/n')
+
+        # print('result--------------------', result.json['event_links'])
+        # # ['https://rendezvouscanada.ca/', 'https://events.destinationcanada.com/en-ca/gomedia-canada',
+        # #     'https://www.destinationcanada.com/en-ca/destination-dialogues']
+        # print('/n')
+
+        # print('result--------------------', result.metadata.status_code)
+        # print('/n')
+
+        # if getattr(result, "status", None) == "failed":
+        #     raise self.retry(exc=Exception("Firecrawl job failed"))
+
+        return {
+            "success": True,
+            # "status": result.status
+        }
+
+    except Exception as exc:
+        # overrides the default delay to retry after 1 minute
+        raise self.retry(exc=exc)
+
+
+@app.task(
+    name="event_links",
+    bind=True,
+    default_retry_delay=30 * 10,  # will retry after 5 minutes
+    retry_backoff=True,  # exponential backoff: 1s, 2s, 4s, 8s...
+    # retry_kwargs={"max_retries": 3},  # number of retries
+    max_retries=3,  # number of retries
+    retry_jitter=True  # add randomness to retry delay (avoid thundering herd)
+)
+# always return json
+def get_event_details(self, url: str):
+    try:
+
+        result = firecrawl_app.scrape(
+            url=url,
+            actions=[
+                {
+                    "type": "scroll",
+                    "direction": "down"
+                }
+            ],
+            formats=[{
+                "type": "json",
+                "schema":  EVENT_DETAILS_SCHEMA,
+                "prompt": """Extract all information related to events including title, description, price,
+                event link, display photo, photos, time zone, hosts, sponsors, address, city, province/state,
+                postal/zip code, country, latitude, longitude, contact email, contact website,
+                contact primary phone, and time slots."""
+            }],
+            # webhook=WebhookConfig(
+            #     url="https://uncogently-unrivalrous-verlie.ngrok-free.dev/api/events/webhook/firecrawl",
+            #     events=["started", "page", "completed", "failed"],
+            # )
+        )
+
+        print('/n')
+        # print('result--------------------', result)
+        print('result--------------------', result)
+        print('/n')
+
+        if result.metadata.status_code == 200:
+            events_details = result.json['events']
+            # NOTE: will convert json response into string
+            result_string = json.dumps(events_details)
+            # NOTE: store result_string into redis
+            redis_client.rpush('events_details', result_string)
+
+        # print('result--------------------', result.json['event_links'])
+        # ['https://rendezvouscanada.ca/', 'https://events.destinationcanada.com/en-ca/gomedia-canada',
+        #     'https://www.destinationcanada.com/en-ca/destination-dialogues']
+        # print('/n')
+
+        # print('result--------------------', result.metadata.status_code)
+        # print('/n')
+
+        # if getattr(result, "status", None) == "failed":
+        #     raise self.retry(exc=Exception("Firecrawl job failed"))
+
+        return {
+            "success": True,
+            # "status": result.status
+        }
+
+    except Exception as exc:
+        # overrides the default delay to retry after 1 minute
+        raise self.retry(exc=exc)
+
+
+# url = f"https://api.firecrawl.dev/v2/batch/scrape/{id}"
+        # headers = {
+        #     "Authorization": f"Bearer {firecrawl_api_key}"
+        # }
+
+        # response = requests.get(url, headers=headers)
+
+        # data = response.json()
+
+        # print('\n')
+        # print('data-----', data)
+        # print('\n')
+
+        # # print(response.status_code)
+        # # print(response.json())
+
+        # data = data["data"] if data["success"] and data["status"] == 'completed' else [
+        # ]
+
+        # all_links = []
+        # for document in data:
+        #     try:
+        #         links = document["json"]["event_links"]
+        #         all_links.append(links)
+        #     except Exception as e:
+        #         print(f"⚠️ No events found in: {e} \n")
+
+        # print("all_links", all_links)
+        # flat_links = list(chain.from_iterable(all_links))
+
+        # print('\n')
+        # print('flat_links', flat_links)
+        # print('\n')
+
+        # return {
+        #     "success": True,
+        #     "status": flat_links
+        # }
